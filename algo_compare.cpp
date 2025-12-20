@@ -357,6 +357,115 @@ int astar(
     return minCost;
 }
 
+// Bidirectional Dijkstra (operates on the same time-expanded Node graph). It builds a reverse graph
+// and runs forward and backward Dijkstra from the start event nodes and all event nodes at the destination stop.
+// Returns minimum travel time (minutes) and fills outPath with the event sequence (start -> ... -> end) or -1 if not found.
+int bidirectional_dijkstra(
+    const unordered_map<Node, vector<pair<Node, int>>, NodeHash>& graph,
+    const vector<Node>& startNodes, const string& endStopId, vector<Node>& outPath
+) {
+    // Build reverse graph0.
+    unordered_map<Node, vector<pair<Node, int>>, NodeHash> rev;
+    for (const auto& [u, neigh] : graph) {
+        for (const auto& p : neigh) {
+            const Node& v = p.first; int c = p.second;
+            rev[v].push_back({u, c});
+        }
+    }
+
+    // Collect target nodes (events at destination stop). They can appear as keys in graph or as neighbor nodes.
+    unordered_set<Node, NodeHash> targetSet;
+    for (const auto& [u, neigh] : graph) if (u.stop_id == endStopId) targetSet.insert(u);
+    for (const auto& [u, neigh] : graph) for (const auto& p : neigh) if (p.first.stop_id == endStopId) targetSet.insert(p.first);
+    if (targetSet.empty()) return -1;
+    vector<Node> targetNodes(targetSet.begin(), targetSet.end());
+
+    // Initialization
+    auto cmp = [&](const pair<int, Node>& a, const pair<int, Node>& b) { return a.first > b.first; };
+    priority_queue<pair<int, Node>, vector<pair<int, Node>>, decltype(cmp)> pqF(cmp), pqB(cmp);
+    unordered_map<Node, int, NodeHash> distF, distB;
+    unordered_map<Node, Node, NodeHash> prevF, prevB;
+    unordered_set<Node, NodeHash> visitedF, visitedB;
+
+    for (const auto& s : startNodes) { distF[s] = 0; pqF.push({0, s}); }
+    for (const auto& t : targetNodes) { distB[t] = 0; pqB.push({0, t}); }
+
+    int bestCost = INT_MAX; Node meeting;
+
+    // Main bidirectional loop
+    while (!pqF.empty() && !pqB.empty()) {
+        // Termination condition: current best estimate can't be improved
+        int topF = pqF.empty() ? INT_MAX : pqF.top().first;
+        int topB = pqB.empty() ? INT_MAX : pqB.top().first;
+        if (topF + topB >= bestCost) break;
+
+        // Expand one step in the direction with smaller top
+        if (topF <= topB) {
+            auto [g, u] = pqF.top(); pqF.pop();
+            if (visitedF.count(u)) continue;
+            visitedF.insert(u);
+            if (visitedB.count(u)) {
+                int cand = distF[u] + distB[u];
+                if (cand < bestCost) { bestCost = cand; meeting = u; }
+            }
+            auto it = graph.find(u);
+            if (it != graph.end()) {
+                for (auto& [v, ec] : it->second) {
+                    int newCost = distF[u] + ec;
+                    if (!distF.count(v) || newCost < distF[v]) {
+                        distF[v] = newCost; prevF[v] = u;
+                        pqF.push({distF[v], v});
+                    }
+                }
+            }
+        } else {
+            auto [g, u] = pqB.top(); pqB.pop();
+            if (visitedB.count(u)) continue;
+            visitedB.insert(u);
+            if (visitedF.count(u)) {
+                int cand = distF[u] + distB[u];
+                if (cand < bestCost) { bestCost = cand; meeting = u; }
+            }
+            auto it = rev.find(u);
+            if (it != rev.end()) {
+                for (auto& [v, ec] : it->second) {
+                    int newCost = distB[u] + ec;
+                    if (!distB.count(v) || newCost < distB[v]) {
+                        distB[v] = newCost; prevB[v] = u;
+                        pqB.push({distB[v], v});
+                    }
+                }
+            }
+        }
+    }
+
+    if (bestCost == INT_MAX) return -1;
+
+    // Reconstruct path: forward part from a start to meeting, and backward part from meeting to a target
+    vector<Node> partF_rev;
+    Node cur = meeting;
+    // Walk back to a start node using prevF (child->parent)
+    while (true) {
+        partF_rev.push_back(cur);
+        if (!prevF.count(cur)) break;
+        cur = prevF[cur];
+    }
+    reverse(partF_rev.begin(), partF_rev.end()); // now start -> ... -> meeting
+
+    vector<Node> partB;
+    cur = meeting;
+    // Walk forward to a target using prevB (in backward search prevB[child]=parent in reverse graph)
+    while (prevB.count(cur)) {
+        cur = prevB[cur];
+        partB.push_back(cur);
+    }
+
+    // Combine
+    outPath = partF_rev;
+    outPath.insert(outPath.end(), partB.begin(), partB.end());
+    return bestCost;
+}
+
 // Dijkstra on a time-expanded graph built entirely inside this function. This provides an alternative implementation
 // that constructs its own EventNode type and graph and demonstrates the same technique used in buildGraph.
 int dijkstra_time_expanded(
@@ -531,8 +640,15 @@ int main() {
     int costA = astar(graph, startNodes, endStopId, pathA);
     auto t3 = chrono::high_resolution_clock::now();
 
+    // Add bidirectional Dijkstra measurement
+    vector<Node> pathBidir;
+    auto tb1 = chrono::high_resolution_clock::now();
+    int costBidir = bidirectional_dijkstra(graph, startNodes, endStopId, pathBidir);
+    auto tb2 = chrono::high_resolution_clock::now();
+
     auto dijkstraTime = chrono::duration_cast<chrono::microseconds>(t2 - t1).count();
     auto astarTime = chrono::duration_cast<chrono::microseconds>(t3 - t2).count();
+    auto bidirTime = chrono::duration_cast<chrono::microseconds>(tb2 - tb1).count();
 
     cout << "Origin: " << stopById[startStopId].name << ", Destination: " << stopById[endStopId].name << endl;
     cout << "-----------------------------" << endl;
@@ -558,7 +674,21 @@ int main() {
              << ", Algorithm time: " << astarTime << " us\n";
     }
 
-    // Dijkstra on an independently built time-expanded graph (demonstration / alternative)
+    // Print bidirectional Dijkstra results
+    cout << "-----------------------------" << endl;
+    cout << "Bidirectional Dijkstra: ";
+    if (costBidir == -1) cout << "No path found.\n";
+    else {
+        for (auto& n : pathBidir) {
+            int h = n.time / 60, m = n.time % 60;
+            cout << stopById[n.stop_id].name << " (" << (h < 10 ? "0" : "") << h << ":" << (m < 10 ? "0" : "") << m << ") ";
+        }
+        cout << "\nTotal duration: " << costBidir << " min, Stops: " << pathBidir.size()
+             << ", Algorithm time: " << bidirTime << " us\n";
+    }
+
+    // Dijkstra on a time-expanded graph built entirely inside this function. This provides an alternative implementation
+    // that constructs its own EventNode type and graph and demonstrates the same technique used in buildGraph.
     vector<pair<string, int>> pathTE;
     auto t4 = chrono::high_resolution_clock::now();
     int costTE = dijkstra_time_expanded(stops, trips, stopTimes, transfers, startStopId, 6*60, endStopId, pathTE);
@@ -578,3 +708,4 @@ int main() {
     }
     return 0;
 }
+
