@@ -16,6 +16,8 @@
 #include <fstream>
 #include <sstream>
 #include <functional>
+#include <unordered_set>
+
 using namespace std;
 
 // safeStoi: helper that validates a numeric string before calling stoi
@@ -91,6 +93,54 @@ int heuristic(const Node& n, const string& goal_id) {
         return 0; // fallback to admissible heuristic 0
     }
     return abs(id1 - id2);
+}
+
+// Convert a lat/lon string to double (handles empty/non-numeric by returning NaN)
+static double safeStodOrNaN(const string& s) {
+    try {
+        if (s.empty()) return nan("");
+        return stod(s);
+    } catch (...) {
+        return nan("");
+    }
+}
+
+// Haversine distance in minutes-equivalent is hard without speed assumptions.
+// We use straight-line distance in km scaled by a constant factor to stay admissible-ish on synthetic data.
+// For real GTFS, consider a tighter bound based on max vehicle speed.
+static double haversineKm(double lat1, double lon1, double lat2, double lon2) {
+    static constexpr double R = 6371.0; // Earth radius km
+    auto deg2rad = [](double d) { return d * M_PI / 180.0; };
+    lat1 = deg2rad(lat1); lon1 = deg2rad(lon1);
+    lat2 = deg2rad(lat2); lon2 = deg2rad(lon2);
+    double dlat = lat2 - lat1;
+    double dlon = lon2 - lon1;
+    double a = sin(dlat/2)*sin(dlat/2) + cos(lat1)*cos(lat2)*sin(dlon/2)*sin(dlon/2);
+    double c = 2 * atan2(sqrt(a), sqrt(1-a));
+    return R * c;
+}
+
+// A* heuristic using stop coordinates when available; falls back to the existing heuristic.
+// Returns an integer in "minutes" units by applying a conservative km->minutes scale.
+static int heuristic_geo(
+    const Node& n,
+    const string& goal_id,
+    const unordered_map<string, Stop>& stopById
+) {
+    auto it1 = stopById.find(n.stop_id);
+    auto it2 = stopById.find(goal_id);
+    if (it1 == stopById.end() || it2 == stopById.end()) return heuristic(n, goal_id);
+
+    double lat1 = safeStodOrNaN(it1->second.lat);
+    double lon1 = safeStodOrNaN(it1->second.lon);
+    double lat2 = safeStodOrNaN(it2->second.lat);
+    double lon2 = safeStodOrNaN(it2->second.lon);
+    if (!isfinite(lat1) || !isfinite(lon1) || !isfinite(lat2) || !isfinite(lon2)) return heuristic(n, goal_id);
+
+    // Conservative: assume max speed 120 km/h => 2 km/min. So minutes >= distance/2.
+    // Using ceil to keep heuristic integer.
+    double km = haversineKm(lat1, lon1, lat2, lon2);
+    return (int)ceil(km / 2.0);
 }
 
 // Generic CSV reader for GTFS files. It reads a file line-by-line, skips the header
@@ -576,6 +626,236 @@ int dijkstra_time_expanded(
     return minCost;
 }
 
+// Simple stats to compare algorithms beyond timing.
+struct AlgoStats {
+    long long pqPops = 0;
+    long long relaxations = 0;
+};
+
+// Dijkstra using Dial's algorithm (bucketed priority queue).
+// Works when edge costs are non-negative integers and the overall distance bound is not too large.
+int dijkstra_dial(
+    const unordered_map<Node, vector<pair<Node, int>>, NodeHash>& graph,
+    const vector<Node>& startNodes,
+    const string& endStopId,
+    vector<Node>& outPath,
+    AlgoStats* stats = nullptr
+) {
+    int maxW = 0;
+    for (const auto& kv : graph) {
+        for (const auto& e : kv.second) maxW = max(maxW, e.second);
+    }
+    if (maxW <= 0) {
+        return dijkstra(graph, startNodes, endStopId, outPath);
+    }
+
+    unordered_map<Node, int, NodeHash> dist;
+    unordered_map<Node, Node, NodeHash> prev;
+
+    int minTime = INT_MAX, maxTime = 0;
+    for (const auto& kv : graph) {
+        minTime = min(minTime, kv.first.time);
+        maxTime = max(maxTime, kv.first.time);
+        for (const auto& e : kv.second) {
+            minTime = min(minTime, e.first.time);
+            maxTime = max(maxTime, e.first.time);
+        }
+    }
+    long long maxDist = (minTime == INT_MAX) ? 0 : (long long)(maxTime - minTime);
+    if (maxDist < 0) maxDist = 0;
+
+    // If bound is too large, buckets are not feasible -> fallback.
+    if (maxDist > 5'000'000) {
+        return dijkstra(graph, startNodes, endStopId, outPath);
+    }
+
+    vector<vector<Node>> buckets((size_t)maxDist + 1);
+
+    auto pushNode = [&](const Node& n, int d) {
+        if (d < 0 || (long long)d > maxDist) return;
+        buckets[(size_t)d].push_back(n);
+    };
+
+    for (const auto& s : startNodes) {
+        dist[s] = 0;
+        pushNode(s, 0);
+    }
+
+    Node bestEnd; int bestCost = INT_MAX;
+
+    for (int curD = 0; curD <= (int)maxDist; ++curD) {
+        auto& bucket = buckets[(size_t)curD];
+        while (!bucket.empty()) {
+            Node u = bucket.back();
+            bucket.pop_back();
+            if (stats) stats->pqPops++;
+
+            auto itDist = dist.find(u);
+            if (itDist == dist.end() || itDist->second != curD) continue;
+
+            if (u.stop_id == endStopId && curD < bestCost) {
+                bestCost = curD;
+                bestEnd = u;
+            }
+
+            auto it = graph.find(u);
+            if (it == graph.end()) continue;
+            for (const auto& [v, w] : it->second) {
+                if (stats) stats->relaxations++;
+                if (w < 0) continue;
+                long long nd = (long long)curD + (long long)w;
+                if (nd > maxDist) continue;
+                int newD = (int)nd;
+
+                auto itV = dist.find(v);
+                if (itV == dist.end() || newD < itV->second) {
+                    dist[v] = newD;
+                    prev[v] = u;
+                    pushNode(v, newD);
+                }
+            }
+        }
+    }
+
+    if (bestCost == INT_MAX) return -1;
+    for (Node at = bestEnd; dist.count(at); at = prev[at]) {
+        outPath.push_back(at);
+        if (!prev.count(at)) break;
+    }
+    reverse(outPath.begin(), outPath.end());
+    return bestCost;
+}
+
+// CSA (Connection Scan Algorithm) based on stop_times only.
+struct Connection {
+    string from_stop;
+    string to_stop;
+    int dep;
+    int arr;
+    string trip_id;
+};
+
+int csa_earliest_arrival(
+    const vector<StopTime>& stopTimes,
+    const unordered_map<string, Stop>& stopById,
+    const string& startStopId,
+    int startTime,
+    const string& endStopId,
+    vector<pair<string,int>>& outPath,
+    AlgoStats* stats = nullptr
+) {
+    unordered_map<string, vector<const StopTime*>> tripStops;
+    tripStops.reserve(stopTimes.size() / 4 + 1);
+    for (const auto& st : stopTimes) tripStops[st.trip_id].push_back(&st);
+
+    vector<Connection> conns;
+    conns.reserve(stopTimes.size());
+
+    for (auto& [tid, vec] : tripStops) {
+        sort(vec.begin(), vec.end(), [](const StopTime* a, const StopTime* b) { return a->stop_sequence < b->stop_sequence; });
+        for (size_t i = 1; i < vec.size(); ++i) {
+            const StopTime* a = vec[i-1];
+            const StopTime* b = vec[i];
+            Connection c{a->stop_id, b->stop_id, a->departure_time, b->arrival_time, tid};
+            if (c.arr >= c.dep) conns.push_back(std::move(c));
+        }
+    }
+
+    sort(conns.begin(), conns.end(), [](const Connection& a, const Connection& b) {
+        if (a.dep != b.dep) return a.dep < b.dep;
+        return a.arr < b.arr;
+    });
+
+    unordered_map<string, int> ea;
+    ea.reserve(stopById.size() * 2 + 1);
+    for (const auto& kv : stopById) ea[kv.first] = INT_MAX;
+    ea[startStopId] = startTime;
+
+    struct Parent { string prevStop; int dep = -1; };
+    unordered_map<string, Parent> parent;
+
+    for (const auto& c : conns) {
+        if (stats) stats->relaxations++;
+        auto itFrom = ea.find(c.from_stop);
+        if (itFrom == ea.end()) continue;
+        if (itFrom->second <= c.dep && c.dep >= startTime) {
+            auto itTo = ea.find(c.to_stop);
+            if (itTo != ea.end() && c.arr < itTo->second) {
+                itTo->second = c.arr;
+                parent[c.to_stop] = Parent{c.from_stop, c.dep};
+                if (stats) stats->pqPops++;
+            }
+        }
+    }
+
+    if (ea.find(endStopId) == ea.end() || ea[endStopId] == INT_MAX) return -1;
+
+    // Stop-level path reconstruction (approx time points)
+    vector<pair<string,int>> rev;
+    string cur = endStopId;
+    rev.push_back({cur, ea[endStopId]});
+    while (cur != startStopId) {
+        auto it = parent.find(cur);
+        if (it == parent.end()) break;
+        rev.push_back({it->second.prevStop, it->second.dep});
+        cur = it->second.prevStop;
+    }
+    reverse(rev.begin(), rev.end());
+    outPath = std::move(rev);
+
+    return ea[endStopId] - startTime;
+}
+
+// A* variant with geographic heuristic when lat/lon is available.
+int astar_geo(
+    const unordered_map<Node, vector<pair<Node, int>>, NodeHash>& graph,
+    const vector<Node>& startNodes,
+    const string& endStopId,
+    const unordered_map<string, Stop>& stopById,
+    vector<Node>& outPath,
+    AlgoStats* stats = nullptr
+) {
+    unordered_map<Node, int, NodeHash> dist;
+    unordered_map<Node, Node, NodeHash> prev;
+    auto cmp = [&](const pair<int, Node>& a, const pair<int, Node>& b) { return a.first > b.first; };
+    priority_queue<pair<int, Node>, vector<pair<int, Node>>, decltype(cmp)> pq(cmp);
+
+    for (const auto& node : startNodes) {
+        dist[node] = 0;
+        pq.push({heuristic_geo(node, endStopId, stopById), node});
+    }
+
+    Node bestEnd; int minCost = INT_MAX;
+    while (!pq.empty()) {
+        auto [fscore, u] = pq.top(); pq.pop();
+        if (stats) stats->pqPops++;
+        int cost = dist[u];
+        if (u.stop_id == endStopId && cost < minCost) { minCost = cost; bestEnd = u; }
+        if (dist[u] < cost) continue;
+
+        auto it = graph.find(u);
+        if (it == graph.end()) continue;
+        for (const auto& [v, edgeCost] : it->second) {
+            if (stats) stats->relaxations++;
+            int newCost = cost + edgeCost;
+            if (!dist.count(v) || newCost < dist[v]) {
+                dist[v] = newCost;
+                prev[v] = u;
+                int f = newCost + heuristic_geo(v, endStopId, stopById);
+                pq.push({f, v});
+            }
+        }
+    }
+
+    if (minCost == INT_MAX) return -1;
+    for (Node at = bestEnd; dist.count(at); at = prev[at]) {
+        outPath.push_back(at);
+        if (!prev.count(at)) break;
+    }
+    reverse(outPath.begin(), outPath.end());
+    return minCost;
+}
+
 int main() {
     // Containers to hold loaded or generated GTFS-like data
     vector<Agency> agencies;
@@ -632,6 +912,13 @@ int main() {
         if (st.stop_id == startStopId)
             startNodes.push_back({st.stop_id, st.departure_time});
 
+    // Determine a start time for schedule-based algorithms (use earliest departure at origin if possible)
+    int startTime = INT_MAX;
+    for (const auto& st : stopTimes) {
+        if (st.stop_id == startStopId) startTime = min(startTime, st.departure_time);
+    }
+    if (startTime == INT_MAX) startTime = 6 * 60;
+
     // Run Dijkstra and A* and measure execution time (microseconds)
     vector<Node> pathD, pathA;
     auto t1 = chrono::high_resolution_clock::now();
@@ -640,17 +927,42 @@ int main() {
     int costA = astar(graph, startNodes, endStopId, pathA);
     auto t3 = chrono::high_resolution_clock::now();
 
+    // A* with geo heuristic (fallbacks to old heuristic if coords missing)
+    AlgoStats stAgeo;
+    vector<Node> pathAgeo;
+    auto ta1 = chrono::high_resolution_clock::now();
+    int costAgeo = astar_geo(graph, startNodes, endStopId, stopById, pathAgeo, &stAgeo);
+    auto ta2 = chrono::high_resolution_clock::now();
+    auto astarGeoTime = chrono::duration_cast<chrono::microseconds>(ta2 - ta1).count();
+
     // Add bidirectional Dijkstra measurement
     vector<Node> pathBidir;
     auto tb1 = chrono::high_resolution_clock::now();
     int costBidir = bidirectional_dijkstra(graph, startNodes, endStopId, pathBidir);
     auto tb2 = chrono::high_resolution_clock::now();
 
+    // Dial / Bucketed Dijkstra
+    AlgoStats stDial;
+    vector<Node> pathDial;
+    auto td1 = chrono::high_resolution_clock::now();
+    int costDial = dijkstra_dial(graph, startNodes, endStopId, pathDial, &stDial);
+    auto td2 = chrono::high_resolution_clock::now();
+    auto dialTime = chrono::duration_cast<chrono::microseconds>(td2 - td1).count();
+
+    // CSA (Connection Scan Algorithm)
+    AlgoStats stCsa;
+    vector<pair<string,int>> pathCsa;
+    auto tc1 = chrono::high_resolution_clock::now();
+    int costCsa = csa_earliest_arrival(stopTimes, stopById, startStopId, startTime, endStopId, pathCsa, &stCsa);
+    auto tc2 = chrono::high_resolution_clock::now();
+    auto csaTime = chrono::duration_cast<chrono::microseconds>(tc2 - tc1).count();
+
     auto dijkstraTime = chrono::duration_cast<chrono::microseconds>(t2 - t1).count();
     auto astarTime = chrono::duration_cast<chrono::microseconds>(t3 - t2).count();
     auto bidirTime = chrono::duration_cast<chrono::microseconds>(tb2 - tb1).count();
 
     cout << "Origin: " << stopById[startStopId].name << ", Destination: " << stopById[endStopId].name << endl;
+
     cout << "-----------------------------" << endl;
     cout << "Dijkstra: ";
     if (costD == -1) cout << "No path found.\n";
@@ -687,8 +999,51 @@ int main() {
              << ", Algorithm time: " << bidirTime << " us\n";
     }
 
-    // Dijkstra on a time-expanded graph built entirely inside this function. This provides an alternative implementation
-    // that constructs its own EventNode type and graph and demonstrates the same technique used in buildGraph.
+    // New results: A* with geo heuristic
+    cout << "-----------------------------" << endl;
+    cout << "A* (Geo heuristic): ";
+    if (costAgeo == -1) cout << "No path found.\n";
+    else {
+        for (auto& n : pathAgeo) {
+            int h = n.time / 60, m = n.time % 60;
+            cout << stopById[n.stop_id].name << " (" << (h < 10 ? "0" : "") << h << ":" << (m < 10 ? "0" : "") << m << ") ";
+        }
+        cout << "\nTotal duration: " << costAgeo << " min, Stops: " << pathAgeo.size()
+             << ", Algorithm time: " << astarGeoTime << " us"
+             << ", Pops: " << stAgeo.pqPops << ", Relax: " << stAgeo.relaxations << "\n";
+    }
+
+    // New results: Dial Dijkstra
+    cout << "-----------------------------" << endl;
+    cout << "Dial Dijkstra (buckets): ";
+    if (costDial == -1) cout << "No path found.\n";
+    else {
+        for (auto& n : pathDial) {
+            int h = n.time / 60, m = n.time % 60;
+            cout << stopById[n.stop_id].name << " (" << (h < 10 ? "0" : "") << h << ":" << (m < 10 ? "0" : "") << m << ") ";
+        }
+        cout << "\nTotal duration: " << costDial << " min, Stops: " << pathDial.size()
+             << ", Algorithm time: " << dialTime << " us"
+             << ", Pops: " << stDial.pqPops << ", Relax: " << stDial.relaxations << "\n";
+    }
+
+    // New results: CSA
+    cout << "-----------------------------" << endl;
+    cout << "CSA (Connection Scan): ";
+    if (costCsa == -1) cout << "No path found.\n";
+    else {
+        for (auto& [sid, t] : pathCsa) {
+            int h = t / 60, m = t % 60;
+            auto it = stopById.find(sid);
+            string nm = (it == stopById.end()) ? sid : it->second.name;
+            cout << nm << " (" << (h < 10 ? "0" : "") << h << ":" << (m < 10 ? "0" : "") << m << ") ";
+        }
+        cout << "\nTotal duration: " << costCsa << " min, Stops: " << pathCsa.size()
+             << ", Algorithm time: " << csaTime << " us"
+             << ", Updates: " << stCsa.pqPops << ", Scanned: " << stCsa.relaxations << "\n";
+    }
+
+    // Dijkstra on a time-expanded graph built entirely inside this function.
     vector<pair<string, int>> pathTE;
     auto t4 = chrono::high_resolution_clock::now();
     int costTE = dijkstra_time_expanded(stops, trips, stopTimes, transfers, startStopId, 6*60, endStopId, pathTE);
@@ -706,5 +1061,6 @@ int main() {
         cout << "\nTotal duration: " << costTE << " min, Stops : " << pathTE.size()
              << ", Algorithm time: " << teTime << " us\n";
     }
+
     return 0;
 }
